@@ -132,7 +132,7 @@ Steps:
          "user_prompt": "I need help developing a {course_duration}-week course content for a {course_title} course. Please use the following syllabus to:\n\n1. If provided, refer to the syllabus text from <syllabus> tags to extract the course learning outcomes.\n2. Design each week to focus on 3 main learning outcomes.\n3. For each main learning outcome, provide 3 supporting sub-learning outcomes.\n\n<syllabus>\n\n{syllabus_text}\n\n</syllabus>\n\nEnsure that each week has 3 main learning outcomes and each of those has 3 supporting sub-learning outcomes."
       }
       ```
-   - **Sample response of course outline route**
+   - **Sample courseOutline route response**
       ```json
       {
          "course_title": "Sample Course",
@@ -174,7 +174,7 @@ Steps:
          "user_prompt":"For the course {course_title}, \ngenerate Week {week_number} content for the main learning outcome:\n{main_learning_outcome}\n\nInclude the following sub-learning outcomes:\n{sub_learning_outcome_list}\n\nFor each sub-learning outcome, provide:\n- 3 video scripts, each 3 minutes long\n- 1 set of reading materials, atleast one page long\n- 1 multiple-choice question per video with correct answer\n\nIf provided, refer to the information within the <additional_context> tags for any supplementary details or guidelines.\n\n<additional_context>\n{additional_context}\n</additional_context>\n\nGenerate the content without any introductory text or explanations."
       }
       ```
-    - **Sample response of course content route**
+    - **Sample courseContent route response**
       ```json
       {
          "CourseContent":{
@@ -213,7 +213,27 @@ Steps:
          "user_question": "What is machine learning?",
          "course_name": "Fundamentals of Machine Learning",
          "course_id": "Dummy-c001",
-         "week_number": 2,
+         "week_number": 2
+      }
+      ```
+   - **Sample qnaBot route response**
+      ```json
+      {
+         "bot_response":"Machine learning (ML) is a subset of artificial intelligence that focuses on developing algorithms and statistical models....",
+         "response":{
+            "ResponseMetadata":{...},
+            "citations":[
+               {
+                  "generatedResponsePart":{...},
+                  "retrievedReferences":[...]
+               }
+            ],
+            "guardrailAction":"NONE",
+            "output":{
+               "text":"..."
+            },
+            "sessionId":"..."
+         }
       }
       ```
 
