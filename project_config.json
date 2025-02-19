@@ -1,0 +1,19 @@
+{
+  "CloudFrontWAFStackName" : "CloudFrontWAFStack",
+  "CourseStackName" : "CourseStack",
+  "QnAStackName" : "QnAStack",
+  "existing_vpc_id" : "",
+  "model_id": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+  "embeddings_model_id" : "amazon.titan-embed-text-v2:0",
+  "qna_model_id": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+  "embeddings_vector_size" : 1024,
+  "vector_index_name" : "couse-content-default-index",
+  "metadata_field": "course_content_metadata",
+  "text_field": "course_content_text_chunk",
+  "vector_field": "couse-content-default-vector",
+  "vpc": {
+    "cidr_range": "10.0.0.0/16",
+    "cidr_mask": 24
+  }
+}
+

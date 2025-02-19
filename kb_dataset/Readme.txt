@@ -1,0 +1,2 @@
+This dataset represents a synthetic course curriculum generated through advanced Large Language Model (LLM). 
+It serves as a practical demonstration of how Amazon Bedrock's knowledge base system processes and integrates weekly educational content.

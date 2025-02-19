@@ -1,0 +1,14 @@
+aws-cdk-lib==2.162.1
+constructs>=10.0.0,<11.0.0
+aws-cdk.aws-lambda-python-alpha
+cdk-nag
+pydantic>=2.9.1
+fsspec
+langchain_community
+langchain-aws
+jwt
+PyJWT
+cryptography
+PyPDF2
+requests-aws4auth
+opensearch-py
