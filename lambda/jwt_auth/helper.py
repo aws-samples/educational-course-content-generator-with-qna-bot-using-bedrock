@@ -5,12 +5,6 @@ import logging
 import os
 import time
 
-os.environ["API_REGION"] = 'us-east-1'
-os.environ["ACCOUNT_ID"] = '205336919675'
-os.environ["COGNITO_APP_CLIENT_ID"] = '6fds58nfioh2281353dvtqdjrg'
-os.environ["COGNITO_USER_POOL_ID"] = 'us-east-1_7VjR2wmoQ'
-os.environ["WEBSOCKET_API_ID"] = 'ppgzxlhwgi'
-
 LOGGER = logging.getLogger()
 BASE_ISSUER_URL = f"https://cognito-idp.{os.environ['API_REGION']}.amazonaws.com/{os.environ['COGNITO_USER_POOL_ID']}"
 
