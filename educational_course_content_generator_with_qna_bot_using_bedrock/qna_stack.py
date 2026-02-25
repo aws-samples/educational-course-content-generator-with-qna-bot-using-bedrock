@@ -24,6 +24,7 @@ from aws_cdk import (
     custom_resources,
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as origins,
+    aws_ec2 as ec2,
 )
 from constructs import Construct
 from cdk_nag import NagSuppressions
@@ -31,7 +32,7 @@ import json
 
 class QnAStack(Stack):
 
-    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, vpc=None, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         with open("project_config.json", "r") as file:
@@ -78,13 +79,24 @@ class QnAStack(Stack):
         )
 
         ######################### Lambda Functions for WebSocket #########################
+        ######## VPC subnet selection for Lambda functions
+        vpc_config = {}
+        if vpc:
+            vpc_config = {
+                "vpc": vpc,
+                "vpc_subnets": ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            }
+
         ######## Connect WebSocket Lambda
         qna_ws_connect_lambda = _lambda.Function(
             self, "QnAWSConnect",
             code=_lambda.Code.from_asset("./lambda/connect"),
             runtime=_lambda.Runtime.PYTHON_3_12,
+            architecture=_lambda.Architecture.ARM_64,
+            memory_size=512,
             handler="index.lambda_handler",
             timeout=Duration.seconds(30),
+            **vpc_config,
             environment={
                 "CONNECTIONS_TABLE": qna_connections_ddb_table.table_name
             },
@@ -96,8 +108,11 @@ class QnAStack(Stack):
             self, "QnAWSDisconnect",
             code=_lambda.Code.from_asset("./lambda/disconnect"),
             runtime=_lambda.Runtime.PYTHON_3_12,
+            architecture=_lambda.Architecture.ARM_64,
+            memory_size=512,
             handler="index.lambda_handler",
             timeout=Duration.seconds(30),
+            **vpc_config,
             environment={
                 "CONNECTIONS_TABLE": qna_connections_ddb_table.table_name
             },
@@ -109,8 +124,11 @@ class QnAStack(Stack):
             self, "QnAWSDefault",
             code=_lambda.Code.from_asset("./lambda/default"),
             runtime=_lambda.Runtime.PYTHON_3_12,
+            architecture=_lambda.Architecture.ARM_64,
+            memory_size=512,
             handler="index.lambda_handler",
             timeout=Duration.seconds(30),
+            **vpc_config,
             environment={
                 "CONNECTIONS_TABLE": qna_connections_ddb_table.table_name
             },
@@ -127,6 +145,7 @@ class QnAStack(Stack):
                                 timeout=Duration.seconds(10),
                                 handler="index.lambda_handler",
                                 layers=[cryptography_layer, pyJWT_layer],
+                                **vpc_config,
                                environment={
                                         "API_REGION": self.region,
                                         "ACCOUNT_ID": self.account,
@@ -144,6 +163,7 @@ class QnAStack(Stack):
                         memory_size=512,
                         timeout=Duration.minutes(1),
                         handler="index.lambda_handler",
+                        **vpc_config,
                     )
         
         ######################### QnA WEB SOCKET #########################
@@ -591,9 +611,8 @@ class QnAStack(Stack):
         haiku_sonnet_bedrock_policy_statement = iam.PolicyStatement(
             effect=iam.Effect.ALLOW,
             actions=["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
-            resources=[f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-3-haiku*:0",
-                       f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-3-sonnet*:0",
-                       f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-3-5-sonnet*:0",
+            resources=[f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-haiku-4-5*",
+                       f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-sonnet-4*",
                        ]
         )
         kb_retrive_generate_policy_statement = iam.PolicyStatement(
@@ -612,7 +631,8 @@ class QnAStack(Stack):
 
         ######################### CDK Nag Suppression #########################
         NagSuppressions.add_resource_suppressions([qna_ws_connect_lambda.role, qna_ws_disconnect_lambda.role, qna_ws_default_lambda.role ,qna_bot_lambda.role, 
-                                                   opensearch_index_cust_res_lambda.role, kb_sync_lambda.role, kb_role],
+                                                   opensearch_index_cust_res_lambda.role, kb_sync_lambda.role, kb_role,
+                                                   jwt_auth_qna_lambda.role],
                             suppressions=[{
                                                 "id": "AwsSolutions-IAM4",
                                                 "reason": "This code is for demo purposes. So granted full access Claude Model from Bedrock service.",
@@ -688,8 +708,20 @@ class QnAStack(Stack):
         # CDK NAG suppression
         NagSuppressions.add_resource_suppressions([qna_cloudfront_dist],
                             suppressions=[{
+                                                "id": "AwsSolutions-CFR1",
+                                                "reason": "This code is for demo purposes. Geo restrictions are managed by WAF GeoMatch rule.",
+                                            },
+                                            {
                                                 "id": "AwsSolutions-CFR4",
                                                 "reason": "This code is for demo purposes. Certificate is not mandatory therefore the Cloudfront certificate will be used.",
                                             },
                                         ],
                             apply_to_children=True)
+
+        # CDK NAG suppression for custom resource Lambda runtime
+        NagSuppressions.add_resource_suppressions_by_path(self,
+                                path="/QnAStack/CustomResourceIndexCreator/framework-onEvent/Resource",
+                                suppressions=[{
+                                                "id": "AwsSolutions-L1",
+                                                "reason": "Custom resource Lambda runtime is managed by CDK framework construct.",
+                                            }])
