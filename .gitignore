@@ -1,0 +1,30 @@
+# CDK
+cdk.context.json
+cdk.out/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Blog post (not part of the public repo)
+BLOG_POST_PART2.md
+previous_blog.pdf
+
+# Downloads (test artifacts)
+downloads/

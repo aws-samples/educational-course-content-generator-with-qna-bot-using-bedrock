@@ -676,5 +676,14 @@ class CourseStack(Stack):
                                             },
                                         ],
                             apply_to_children=True)
+
+        # CDK NAG suppression for Lambda runtime version
+        NagSuppressions.add_stack_suppressions(self,
+                                [
+                                    {
+                                        "id": "AwsSolutions-L1",
+                                        "reason": "Python 3.12 is the latest runtime version supported by all Lambda layers and dependencies used in this solution.",
+                                    },
+                                ])
         
 

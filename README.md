@@ -40,15 +40,32 @@ A streamlined content approval process that includes:
 
 
 **2. QnA WebSocket API (`qnaWSapi`):**
-   - Question-answering bot <br>
+   - Question-answering bot with **dual-mode support**: Strands Agent mode (default) or Classic mode <br>
    Supported by:
-   - AWS Lambda for processing
+   - AWS Lambda for processing (with Strands Agents SDK in agent mode)
    - Amazon Bedrock KnowledgeBase for AI response generation
    - OpenSearch Serverless for data storage and retrieval
    - Knowledge Base synchronization via Lambda function
    - S3 bucket storing approved course content as knowledge source
+   - Amazon Bedrock Guardrails for content safety
 
-![QnA Chatbot](architecture_diagrams/qna_bot_architecture.png)
+![QnA Chatbot - Strands Agent Mode](architecture_diagrams/strands_qna_bot_architecture.png)
+![QnA Chatbot - Classic Mode](architecture_diagrams/qna_bot_architecture.png)
+
+### QnA Bot Modes
+
+The QnA bot supports two deployment modes, configured via `qna_bot_mode` in `project_config.json`:
+
+| Mode | Description |
+|---|---|
+| **`strands`** (default) | Deploys a [Strands Agent](https://strandsagents.com/) with the built-in `retrieve` tool to [Amazon Bedrock AgentCore Runtime](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/what-is-bedrock-agentcore.html). Provides session isolation, persistence, built-in observability, and auto-scaling. |
+| **`classic`** | Uses the direct Amazon Bedrock `RetrieveAndGenerate` API on Lambda for straightforward question-answering. |
+
+To switch modes, update `project_config.json` and redeploy the QnA stack:
+```bash
+# In project_config.json, set: "qna_bot_mode": "strands" or "classic"
+cdk deploy QnAStack
+```
 Both WebSocket APIs share common security components (can be separated based on requirements):
 - Amazon Cognito for user authentication
 - AWS WAF for threat protection
@@ -110,9 +127,24 @@ Steps:
 
 ### Using the Application
 
-1. Create a user in the Cognito User Pool using the AWS Console or CLI. Alternatively, you can use the [cognito-user-token-helper](https://github.com/aws-samples/cognito-user-token-helper) repository to easily create new cognito user and generate JWT tokens for testing.
+1. **Create a test user and get a JWT token** using the provided helper script. This script automatically reads the Cognito User Pool details from your deployed CloudFormation stack, creates a user, and outputs the JWT token along with ready-to-use `wscat` commands:
+   ```bash
+   python scripts/create_cognito_user.py
+   ```
 
-2. Connect to the WebSocket endpoint using wscat.
+   You can customize the username, password, and region:
+   ```bash
+   python scripts/create_cognito_user.py --username student1 --password 'Student@2026!' --region us-east-1
+   ```
+
+   To refresh an expired token for an existing user (tokens expire after 24 hours):
+   ```bash
+   python scripts/create_cognito_user.py --token-only --username testuser --password 'TestUser@2026!'
+   ```
+
+   Alternatively, you can use the [cognito-user-token-helper](https://github.com/aws-samples/cognito-user-token-helper) repository or create users manually via the AWS Console.
+
+2. Connect to the WebSocket endpoint using wscat (the helper script above prints the exact command with your token):
    ```bash
    wscat -c wss://xxxxxxxxxx.execute-api.us-east-1.amazonaws.com/dev \
    -H "Authorization: Bearer YOUR_JWT_TOKEN"
@@ -237,6 +269,48 @@ Steps:
       }
       ```
 
+
+## Demo UI
+
+A local Streamlit chat interface is included to showcase the QnA Bot end-to-end. It authenticates via Amazon Cognito, connects to the QnA WebSocket API with a JWT Bearer token, and renders the agent's Markdown responses in a streaming chat UI.
+
+![QnA Bot Streamlit Demo](architecture_diagrams/Qna_Bot_streamlit.png)
+
+The demo app provides:
+- **Cognito authentication** – Logs in directly from the sidebar using the deployed User Pool
+- **Course selection** – Dropdown menus for available courses and week numbers from the knowledge base
+- **Real-time chat** – Sends questions via authenticated WebSocket and streams responses with a typing effect
+- **Markdown rendering** – Displays the agent's structured Markdown answers natively in chat bubbles
+
+### Running the Demo
+
+1. **Create a test user** (first time only):
+   ```bash
+   python scripts/create_cognito_user.py
+   ```
+
+2. **Install demo dependencies** (from the project virtual environment):
+   ```bash
+   pip install -r demo/requirements.txt
+   ```
+
+3. **Launch the Streamlit app:**
+   ```bash
+   streamlit run demo/app.py
+   ```
+
+4. **In the sidebar:**
+   - The app auto-detects your deployed infrastructure (Cognito, WebSocket endpoints)
+   - Enter credentials (default: `testuser` / `TestUser@2026!`) and click **🔑 Login**
+   - Select a course from the dropdown (e.g., *Fundamentals of Machine Learning*)
+   - Choose the week number
+
+5. **Start asking questions in the chat!** Try questions like:
+   - "What is machine learning?"
+   - "Explain the difference between supervised and unsupervised learning"
+   - "What are neural networks?"
+
+> **Note:** The demo requires all stacks to be deployed and AWS credentials configured. The Streamlit app reads Cognito and WebSocket endpoint details directly from CloudFormation stack outputs.
 
 ## Data Flow
 
