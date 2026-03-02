@@ -26,8 +26,8 @@ This solution handles course outline and content generation through a WebSocket 
     - Course outline generation route
     - Course content generation route
 - AWS Lambda functions processing each route
-- Integration with Bedrock LLM (Claude Sonnet 3.5) for AI content generation
-- Amazon SNS topics and Dead Letter Queues for reliable message handling
+- Integration with Bedrock LLM (Claude Sonnet 4.6) for AI content generation
+- Amazon SQS queues with Dead Letter Queues for reliable asynchronous message handling
 - S3 Output Buckets storing generated content
 
 ![Faculty finalize the course Content](architecture_diagrams/faculty_approval_workflow.png)
@@ -49,8 +49,7 @@ A streamlined content approval process that includes:
    - S3 bucket storing approved course content as knowledge source
    - Amazon Bedrock Guardrails for content safety
 
-![QnA Chatbot - Strands Agent Mode](architecture_diagrams/strands_qna_bot_architecture.png)
-![QnA Chatbot - Classic Mode](architecture_diagrams/qna_bot_architecture.png)
+![QnA Chatbot - Strands Agent & Classic Mode](architecture_diagrams/qna_bot_architecture.png)
 
 ### QnA Bot Modes
 
@@ -75,7 +74,7 @@ Key architectural features:
 - AWS Web Application Firewall (WAF) filters malicious traffic
 - Amazon CloudFront serves as a WebSocket distribution layer for optimized content delivery
 - Amazon SQS enables asynchronous processing of content generation requests
-- Amazon Bedrock (Claude 3.5 Sonnet) powers the AI content generation
+- Amazon Bedrock (Claude Sonnet 4.6) powers the AI content generation
 - DynamoDB Connection Tables for session management
 
 Note: While this implementation uses shared security components for demonstration purposes, in production environments you may want to implement separate Cognito user pools, WAF rules, and Lambda Authorizers for each API based on your security requirements.
@@ -88,6 +87,7 @@ Prerequisites:
 - Python 3.12
 - AWS CDK CLI
 - AWS CLI configured with appropriate credentials
+- [Docker](https://www.docker.com/) installed and running (required for bundling dependencies during CDK synthesis in Strands Agent mode)
 - [wscat](https://github.com/websockets/wscat) installation for WebSocket testing
 
 Steps:
@@ -110,16 +110,17 @@ Steps:
    ```
    pip install -r requirements.txt
    ```
-6. synthesize the CloudFormation template for this project.
+6. Synthesize the CloudFormation template for this project:
     ```
     cdk synth --all
     ```
 ### Deployment
 
-1. Review and modify the `project_config.json` file to customize your deployment settings.
+1. Review and modify the `project_config.json` file to customize your deployment settings. Enable model access for **Anthropic's Claude Sonnet 4.6** and **Amazon Titan Text Embeddings V2** in your AWS account via the Amazon Bedrock console.
 
-2. Deploy the stacks:
+2. Bootstrap and deploy the stacks:
    ```
+   cdk bootstrap
    cdk deploy --all
    ```
 
@@ -134,7 +135,7 @@ Steps:
 
    You can customize the username, password, and region:
    ```bash
-   python scripts/create_cognito_user.py --username student1 --password 'Student@2026!' --region us-east-1
+   python scripts/create_cognito_user.py --username testuser --password 'TestUser@2026!' --region us-east-1
    ```
 
    To refresh an expired token for an existing user (tokens expire after 24 hours):
@@ -203,7 +204,7 @@ Steps:
          "course_title": "Fundamentals of Machine Learning",
          "main_learning_outcome" : "Understand the basics of machine learning and its applications",
          "sub_learning_outcome_list" : ["Define machine learning and its relationship to artificial intelligence","Identify real-world applications of machine learning","Distinguish between supervised, unsupervised, and reinforcement learning"],
-         "user_prompt":"For the course {course_title}, \ngenerate Week {week_number} content for the main learning outcome:\n{main_learning_outcome}\n\nInclude the following sub-learning outcomes:\n{sub_learning_outcome_list}\n\nFor each sub-learning outcome, provide:\n- 3 video scripts, each 3 minutes long\n- 1 set of reading materials, atleast one page long\n- 1 multiple-choice question per video with correct answer\n\nIf provided, refer to the information within the <additional_context> tags for any supplementary details or guidelines.\n\n<additional_context>\n{additional_context}\n</additional_context>\n\nGenerate the content without any introductory text or explanations."
+         "user_prompt":"For the course {course_title}, \ngenerate Week {week_number} content for the main learning outcome:\n{main_learning_outcome}\n\nInclude the following sub-learning outcomes:\n{sub_learning_outcome_list}\n\nFor each sub-learning outcome, provide:\n- 3 video scripts, each 3 minutes long\n- 1 set of reading materials, at least one page long\n- 1 multiple-choice question per video with correct answer\n\nIf provided, refer to the information within the <additional_context> tags for any supplementary details or guidelines.\n\n<additional_context>\n{additional_context}\n</additional_context>\n\nGenerate the content without any introductory text or explanations."
       }
       ```
     - **Sample courseContent route response**
@@ -248,7 +249,13 @@ Steps:
          "week_number": 2
       }
       ```
-   - **Sample qnaBot route response**
+   - **Sample qnaBot route response (Strands Agent mode)**
+      ```json
+      {
+         "bot_response":"Machine learning (ML) is a subset of artificial intelligence that focuses on developing algorithms and statistical models...."
+      }
+      ```
+   - **Sample qnaBot route response (Classic mode)**
       ```json
       {
          "bot_response":"Machine learning (ML) is a subset of artificial intelligence that focuses on developing algorithms and statistical models....",
@@ -314,12 +321,12 @@ The demo app provides:
 
 ## Data Flow
 
-1. User connects to the ClouFront endpoint which is attached to WebSocket API and authenticates.
+1. User connects to the CloudFront endpoint which is attached to WebSocket API and authenticates.
 2. User sends a request for course outline or content generation.
 3. The request is processed by the appropriate Lambda function.
 4. The Lambda function invokes Amazon Bedrock to generate the requested content.
 5. Generated content is stored in S3 and returned to the user via WebSocket.
-6. For QnA, user questions are processed by the QnA bot Lambda, which uses Bedrock and the knowledge base to generate answers.
+6. For QnA, user questions are processed by the QnA bot. In Strands Agent mode, a proxy Lambda forwards requests to the Bedrock AgentCore Runtime, where a Strands Agent autonomously retrieves relevant content from the knowledge base. In Classic mode, the Lambda directly calls the Bedrock `RetrieveAndGenerate` API.
 
 This flow ensures real-time communication, secure authentication, and efficient processing of user requests for course generation and question answering.
 
@@ -332,6 +339,7 @@ The application implements multiple layers of security:
 - Amazon CloudFront provides built-in DDoS protection
 - Amazon Cognito handles user authentication
 - JWT-based Lambda Authorizers validate WebSocket connections
+- Amazon Bedrock Guardrails enforce content safety policies (filters harmful content, protects PII, blocks off-topic requests)
 - AWS IAM policies enforce strict access control to AWS resources
 
 ## Scalability and Performance
