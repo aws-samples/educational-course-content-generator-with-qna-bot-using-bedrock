@@ -24,20 +24,29 @@ from aws_cdk import (
     custom_resources,
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as origins,
+    aws_ec2 as ec2,
 )
 from constructs import Construct
 from cdk_nag import NagSuppressions
 import json
 
+# Conditionally import AgentCore alpha construct
+try:
+    import aws_cdk.aws_bedrock_agentcore_alpha as agentcore
+    AGENTCORE_AVAILABLE = True
+except ImportError:
+    AGENTCORE_AVAILABLE = False
+
 class QnAStack(Stack):
 
-    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, vpc=None, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         with open("project_config.json", "r") as file:
             variables = json.load(file)
         
         qna_model_id = variables["qna_model_id"]
+        qna_bot_mode = variables.get("qna_bot_mode", "strands")  # "strands" (default) or "classic"
 
         ######################### Imports  #########################
         # Import the existing user pool
@@ -78,13 +87,24 @@ class QnAStack(Stack):
         )
 
         ######################### Lambda Functions for WebSocket #########################
+        ######## VPC subnet selection for Lambda functions
+        vpc_config = {}
+        if vpc:
+            vpc_config = {
+                "vpc": vpc,
+                "vpc_subnets": ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            }
+
         ######## Connect WebSocket Lambda
         qna_ws_connect_lambda = _lambda.Function(
             self, "QnAWSConnect",
             code=_lambda.Code.from_asset("./lambda/connect"),
             runtime=_lambda.Runtime.PYTHON_3_12,
+            architecture=_lambda.Architecture.ARM_64,
+            memory_size=512,
             handler="index.lambda_handler",
             timeout=Duration.seconds(30),
+            **vpc_config,
             environment={
                 "CONNECTIONS_TABLE": qna_connections_ddb_table.table_name
             },
@@ -96,8 +116,11 @@ class QnAStack(Stack):
             self, "QnAWSDisconnect",
             code=_lambda.Code.from_asset("./lambda/disconnect"),
             runtime=_lambda.Runtime.PYTHON_3_12,
+            architecture=_lambda.Architecture.ARM_64,
+            memory_size=512,
             handler="index.lambda_handler",
             timeout=Duration.seconds(30),
+            **vpc_config,
             environment={
                 "CONNECTIONS_TABLE": qna_connections_ddb_table.table_name
             },
@@ -109,8 +132,11 @@ class QnAStack(Stack):
             self, "QnAWSDefault",
             code=_lambda.Code.from_asset("./lambda/default"),
             runtime=_lambda.Runtime.PYTHON_3_12,
+            architecture=_lambda.Architecture.ARM_64,
+            memory_size=512,
             handler="index.lambda_handler",
             timeout=Duration.seconds(30),
+            **vpc_config,
             environment={
                 "CONNECTIONS_TABLE": qna_connections_ddb_table.table_name
             },
@@ -127,6 +153,7 @@ class QnAStack(Stack):
                                 timeout=Duration.seconds(10),
                                 handler="index.lambda_handler",
                                 layers=[cryptography_layer, pyJWT_layer],
+                                **vpc_config,
                                environment={
                                         "API_REGION": self.region,
                                         "ACCOUNT_ID": self.account,
@@ -135,16 +162,97 @@ class QnAStack(Stack):
                                     },
                             )
 
-        ######## QnA Bot Lambda
-        qna_bot_lambda = _lambda.Function(self, 
-                        "qna_bot_lambda",
-                        code=_lambda.Code.from_asset("./lambda/qna_bot"),
-                        runtime=_lambda.Runtime.PYTHON_3_12,
-                        architecture=_lambda.Architecture.ARM_64,
-                        memory_size=512,
-                        timeout=Duration.minutes(1),
-                        handler="index.lambda_handler",
-                    )
+        ######## QnA Bot - Dual mode: Strands Agent on AgentCore or Classic on Lambda
+        if qna_bot_mode == "strands" and AGENTCORE_AVAILABLE:
+            # Strands Agent mode: deploys Strands Agent to Bedrock AgentCore Runtime
+            # AgentCore provides session isolation, persistence, observability, and auto-scaling
+            # A proxy Lambda bridges the WebSocket API Gateway to AgentCore Runtime
+
+            # Package agent code WITH pre-installed dependencies as a zip asset
+            # AgentCore Runtime has a 30s init timeout, so deps must be pre-bundled
+            from aws_cdk import aws_s3_assets as s3_assets, BundlingOptions, DockerImage
+            agentcore_code_asset = s3_assets.Asset(self, "AgentCoreCodeAsset",
+                path="./lambda/qna_bot_strands",
+                bundling=BundlingOptions(
+                    image=DockerImage.from_registry("public.ecr.aws/sam/build-python3.12:latest"),
+                    command=[
+                        "bash", "-c",
+                        "pip install -r requirements.txt -t /asset-output/ --platform manylinux2014_aarch64 --python-version 3.12 --only-binary=:all: && cp -r . /asset-output/"
+                    ],
+                ),
+            )
+
+            # Create the AgentCore Runtime artifact from the S3 asset
+            agentcore_artifact = agentcore.AgentRuntimeArtifact.from_s3(
+                s3.Location(
+                    bucket_name=agentcore_code_asset.s3_bucket_name,
+                    object_key=agentcore_code_asset.s3_object_key,
+                ),
+                agentcore.AgentCoreRuntime.PYTHON_3_12,
+                ["agentcore_handler.py"],
+            )
+
+            # Create the AgentCore Runtime hosting the Strands Agent
+            # Note: env vars for KB_ID etc. are added after KB creation below
+            qna_agent_runtime = agentcore.Runtime(self, "QnAAgentCoreRuntime",
+                runtime_name="qna_strands_agent",
+                agent_runtime_artifact=agentcore_artifact,
+                description="QnA Bot powered by Strands Agent on Bedrock AgentCore Runtime",
+                environment_variables={
+                    "QnA_MODEL_ID": qna_model_id,
+                },
+            )
+
+            # Grant AgentCore Runtime permissions to invoke Bedrock models and KB
+            qna_agent_runtime.grant_principal.add_to_principal_policy(iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+                resources=[f"arn:aws:bedrock:*::foundation-model/anthropic.claude-*",
+                           f"arn:aws:bedrock:{self.region}:{self.account}:inference-profile/us.anthropic.claude-*"],
+            ))
+
+            # Proxy Lambda to bridge WebSocket API Gateway to AgentCore Runtime
+            qna_bot_lambda = _lambda.Function(self,
+                            "qna_bot_lambda",
+                            code=_lambda.Code.from_asset("./lambda/qna_bot_agentcore_proxy"),
+                            runtime=_lambda.Runtime.PYTHON_3_12,
+                            architecture=_lambda.Architecture.ARM_64,
+                            memory_size=512,
+                            timeout=Duration.minutes(3),
+                            handler="index.lambda_handler",
+                            **vpc_config,
+                            environment={
+                                "AGENT_RUNTIME_ARN": qna_agent_runtime.agent_runtime_arn,
+                            },
+                        )
+
+            # Grant proxy Lambda permission to invoke AgentCore Runtime
+            qna_bot_lambda.add_to_role_policy(iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["bedrock-agentcore:InvokeAgentRuntime"],
+                resources=[
+                    qna_agent_runtime.agent_runtime_arn,
+                    f"{qna_agent_runtime.agent_runtime_arn}/*",
+                ],
+            ))
+
+            CfnOutput(self, "AgentCoreRuntimeArn", value=qna_agent_runtime.agent_runtime_arn,
+                       description="Bedrock AgentCore Runtime ARN for the QnA Strands Agent")
+
+        else:
+            # Classic mode: uses direct Bedrock RetrieveAndGenerate API on Lambda
+            qna_bot_lambda = _lambda.Function(self,
+                            "qna_bot_lambda",
+                            code=_lambda.Code.from_asset("./lambda/qna_bot"),
+                            runtime=_lambda.Runtime.PYTHON_3_12,
+                            architecture=_lambda.Architecture.ARM_64,
+                            memory_size=512,
+                            timeout=Duration.minutes(1),
+                            handler="index.lambda_handler",
+                            **vpc_config,
+                        )
+
+        CfnOutput(self, "QnABotMode", value=qna_bot_mode, description="QnA Bot deployment mode (strands or classic)")
         
         ######################### QnA WEB SOCKET #########################
         ######## Integration
@@ -588,12 +696,34 @@ class QnAStack(Stack):
         qna_bot_lambda.add_environment("GUARDRAIL_ID", qna_bot_guardrail.attr_guardrail_id)
         qna_bot_lambda.add_environment("GUARDRAIL_VERSION", qna_bot_guardrail_version.attr_version)
 
+        # Grant AgentCore Runtime KB and guardrail access, and set env vars (when in strands mode)
+        if qna_bot_mode == "strands" and AGENTCORE_AVAILABLE:
+            qna_agent_runtime.grant_principal.add_to_principal_policy(iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["bedrock:Retrieve", "bedrock:RetrieveAndGenerate"],
+                resources=[knowledge_base.attr_knowledge_base_arn],
+            ))
+            qna_agent_runtime.grant_principal.add_to_principal_policy(iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["bedrock:ApplyGuardrail"],
+                resources=[qna_bot_guardrail.attr_guardrail_arn],
+            ))
+            # Add KB_ID and guardrail env vars to AgentCore Runtime via L1 override
+            # (These are created after the Runtime in the CDK tree, so we use property override)
+            cfn_runtime = qna_agent_runtime.node.default_child
+            cfn_runtime.add_property_override("EnvironmentVariables", {
+                "QnA_MODEL_ID": qna_model_id,
+                "KB_ID": knowledge_base.attr_knowledge_base_id,
+                "GUARDRAIL_ID": qna_bot_guardrail.attr_guardrail_id,
+                "GUARDRAIL_VERSION": qna_bot_guardrail_version.attr_version,
+            })
+
         haiku_sonnet_bedrock_policy_statement = iam.PolicyStatement(
             effect=iam.Effect.ALLOW,
             actions=["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
-            resources=[f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-3-haiku*:0",
-                       f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-3-sonnet*:0",
-                       f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-3-5-sonnet*:0",
+            resources=[f"arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-4-5*",
+                       f"arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4*",
+                       f"arn:aws:bedrock:{self.region}:{self.account}:inference-profile/us.anthropic.claude-*",
                        ]
         )
         kb_retrive_generate_policy_statement = iam.PolicyStatement(
@@ -612,7 +742,8 @@ class QnAStack(Stack):
 
         ######################### CDK Nag Suppression #########################
         NagSuppressions.add_resource_suppressions([qna_ws_connect_lambda.role, qna_ws_disconnect_lambda.role, qna_ws_default_lambda.role ,qna_bot_lambda.role, 
-                                                   opensearch_index_cust_res_lambda.role, kb_sync_lambda.role, kb_role],
+                                                   opensearch_index_cust_res_lambda.role, kb_sync_lambda.role, kb_role,
+                                                   jwt_auth_qna_lambda.role],
                             suppressions=[{
                                                 "id": "AwsSolutions-IAM4",
                                                 "reason": "This code is for demo purposes. So granted full access Claude Model from Bedrock service.",
@@ -688,8 +819,39 @@ class QnAStack(Stack):
         # CDK NAG suppression
         NagSuppressions.add_resource_suppressions([qna_cloudfront_dist],
                             suppressions=[{
+                                                "id": "AwsSolutions-CFR1",
+                                                "reason": "This code is for demo purposes. Geo restrictions are managed by WAF GeoMatch rule.",
+                                            },
+                                            {
                                                 "id": "AwsSolutions-CFR4",
                                                 "reason": "This code is for demo purposes. Certificate is not mandatory therefore the Cloudfront certificate will be used.",
                                             },
                                         ],
                             apply_to_children=True)
+
+        # CDK NAG suppression for custom resource Lambda runtime
+        NagSuppressions.add_resource_suppressions_by_path(self,
+                                path="/QnAStack/CustomResourceIndexCreator/framework-onEvent/Resource",
+                                suppressions=[{
+                                                "id": "AwsSolutions-L1",
+                                                "reason": "Custom resource Lambda runtime is managed by CDK framework construct.",
+                                            }])
+
+        # CDK NAG suppression for Lambda runtime version (Python 3.12 is latest stable supported)
+        NagSuppressions.add_stack_suppressions(self,
+                                [
+                                    {
+                                        "id": "AwsSolutions-L1",
+                                        "reason": "Python 3.12 is the latest runtime version supported by all Lambda layers and dependencies used in this solution.",
+                                    },
+                                ])
+
+        # CDK NAG suppressions for AgentCore Runtime resources (only when strands mode is active)
+        if qna_bot_mode == "strands" and AGENTCORE_AVAILABLE:
+            NagSuppressions.add_resource_suppressions_by_path(self,
+                                path="/QnAStack/QnAAgentCoreRuntime/ExecutionRole/DefaultPolicy/Resource",
+                                suppressions=[{
+                                    "id": "AwsSolutions-IAM5",
+                                    "reason": "AgentCore Runtime execution role requires wildcard permissions for CloudWatch logs, workload identity, and Bedrock model access. These are managed by the CDK AgentCore construct.",
+                                }],
+                                apply_to_children=True)

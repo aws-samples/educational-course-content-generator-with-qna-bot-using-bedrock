@@ -62,8 +62,8 @@ def save_json_to_s3(bucket, key, llm_json_response):
 
 
 def invoke_bedrock_converse_api(model_id, course_title, course_duration, syllabus_text, user_prompt, pydantic_classes, is_streaming):
-    # model_id = "anthropic.claude-3-haiku-20240307-v1:0"
-    # model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    # model_id = "anthropic.claude-haiku-4-5-20251001-v1:0"
+    # model_id = "anthropic.claude-sonnet-4-6"
 
     system_prompt =f"""You are an AI assistant tasked with helping an instructor develop a course outline for a {course_title} course.
 You have expertise in curriculum design. Your role is to analyze the provided syllabus, extract learning outcomes, 

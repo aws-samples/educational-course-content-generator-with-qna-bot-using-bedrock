@@ -44,7 +44,7 @@ Include the following sub-learning outcomes:
 
 For each sub-learning outcome, provide:
 - 3 video scripts, each 3 minutes long
-- 1 set of reading materials, atleast one page long
+- 1 set of reading materials, at least one page long
 - 1 multiple-choice question per video with correct answer
 
 If provided, refer to the information within the <additional_context> tags for any supplementary details or guidelines.

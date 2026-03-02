@@ -4,7 +4,6 @@
 import json
 import boto3
 
-sns_client = boto3.client('sns')
 sqs_client = boto3.client("sqs")
 
 def send_message_to_client(apigatewaymanagementapi_client, connection_id, response):

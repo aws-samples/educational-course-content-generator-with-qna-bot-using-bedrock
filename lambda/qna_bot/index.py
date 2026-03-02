@@ -4,7 +4,7 @@
 import json
 import boto3
 import os
-from helper import *
+from helper import get_filter_condition, retrive_from_kb
 
 
 def lambda_handler(event, context):

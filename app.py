@@ -24,9 +24,9 @@ waf_stack = CloudFrontWAFStack(app, variables["CloudFrontWAFStackName"],)
 # This Stack will create resources for the Course Outline and course content module
 course_stack = CourseStack(app,variables["CourseStackName"],)
 
-qna_stack = QnAStack(app, variables["QnAStackName"],)
+qna_stack = QnAStack(app, variables["QnAStackName"], vpc=course_stack.vpc)
 
-# qna_stack.add_dependency(course_stack)
+qna_stack.add_dependency(course_stack)
 
 Aspects.of(app).add(cdk_nag.AwsSolutionsChecks(reports=True, verbose=True))
 app.synth()

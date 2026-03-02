@@ -62,6 +62,9 @@ class CourseStack(Stack):
             }
         )
 
+        # Expose VPC for cross-stack references
+        self.vpc = vpc
+
         # Create an S3 VPC Endpoint
         s3_endpoint = ec2.GatewayVpcEndpoint(
             self,
@@ -417,8 +420,8 @@ class CourseStack(Stack):
         haiku_sonnet_bedrock_policy_statement = iam.PolicyStatement(
             effect=iam.Effect.ALLOW,
             actions=["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
-            resources=[f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-3-5-haiku*:0",
-                       f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-3-5-sonnet*:0",
+            resources=[f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-haiku-4-5*",
+                       f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-sonnet-4*",
                        ]
         )
         course_outline_llm_lambda.add_to_role_policy(haiku_sonnet_bedrock_policy_statement)
@@ -472,8 +475,8 @@ class CourseStack(Stack):
         haiku_sonnet_bedrock_policy_statement = iam.PolicyStatement(
             effect=iam.Effect.ALLOW,
             actions=["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
-            resources=[f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-3-5-haiku*:0",
-                       f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-3-5-sonnet*:0",
+            resources=[f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-haiku-4-5*",
+                       f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-sonnet-4*",
                        ]
         )
         course_content_llm_lambda.add_to_role_policy(haiku_sonnet_bedrock_policy_statement)
@@ -664,10 +667,23 @@ class CourseStack(Stack):
         # CDK NAG suppression
         NagSuppressions.add_resource_suppressions([course_cloudfront_dist],
                             suppressions=[{
+                                                "id": "AwsSolutions-CFR1",
+                                                "reason": "This code is for demo purposes. Geo restrictions are managed by WAF GeoMatch rule.",
+                                            },
+                                            {
                                                 "id": "AwsSolutions-CFR4",
                                                 "reason": "This code is for demo purposes. Certificate is not mandatory therefore the Cloudfront certificate will be used.",
                                             },
                                         ],
                             apply_to_children=True)
+
+        # CDK NAG suppression for Lambda runtime version
+        NagSuppressions.add_stack_suppressions(self,
+                                [
+                                    {
+                                        "id": "AwsSolutions-L1",
+                                        "reason": "Python 3.12 is the latest runtime version supported by all Lambda layers and dependencies used in this solution.",
+                                    },
+                                ])
         
 

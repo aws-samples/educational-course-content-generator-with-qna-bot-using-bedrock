@@ -71,8 +71,8 @@ def save_json_to_s3(bucket, key, llm_json_response):
 def invoke_bedrock_converse_api(model_id, course_title, week_number, main_learning_outcome, 
                                    sub_learning_outcome_list, additional_context, 
                                    user_prompt, pydantic_classes, is_streaming):
-    # model_id = "anthropic.claude-3-haiku-20240307-v1:0"
-    # model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    # model_id = "anthropic.claude-haiku-4-5-20251001-v1:0"
+    # model_id = "anthropic.claude-sonnet-4-6"
 
     system_prompt =f"""You are an AI assistant specialized in educational content creation.
 Your task is to generate course materials based on given learning outcomes.
@@ -155,39 +155,6 @@ def parse_bedrock_tool_response(response):
 def send_message_to_ws_client(apigatewaymanagementapi_client, connection_id, response):
         apigatewaymanagementapi_client.post_to_connection(ConnectionId=connection_id, 
                                                           Data=json.dumps(response).encode('utf-8'))
-
-def process_stream_obj_old(response, apigatewaymanagementapi_client, connection_id):
-        final_response=""
-        for event in response['stream']:
-            if 'messageStart' in event:
-                    print(f"\nRole: {event['messageStart']['role']}")
-
-            elif 'contentBlockDelta' in event:
-                new_text = event['contentBlockDelta']['delta']['text']
-                final_response+=new_text
-                send_message_to_ws_client(apigatewaymanagementapi_client, connection_id, new_text)
-
-            elif 'messageStop' in event:
-                print(f"\nStop reason: {event['messageStop']['stopReason']}")
-                send_message_to_ws_client(apigatewaymanagementapi_client, connection_id, event['messageStop'])
-            
-            elif 'metadata' in event:
-                    metadata = event['metadata']
-                    if 'usage' in metadata:
-                        print("\nToken usage")
-                        print(f"Input tokens: {metadata['usage']['inputTokens']}")
-                        print(
-                            f":Output tokens: {metadata['usage']['outputTokens']}")
-                        print(f":Total tokens: {metadata['usage']['totalTokens']}")
-                    if 'metrics' in event['metadata']:
-                        print(
-                            f"Latency: {metadata['metrics']['latencyMs']} milliseconds")
-                    if 'guardrails_usage' in event['metadata']:
-                        print(event['metadata']['guardrails_usage'])
-            else:
-                print("no key found")
-
-        return final_response
 
 def process_stream_obj(response, apigatewaymanagementapi_client, connection_id):
         stop_reason = ""
