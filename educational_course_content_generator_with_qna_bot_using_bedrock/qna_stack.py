@@ -172,7 +172,7 @@ class QnAStack(Stack):
             # AgentCore Runtime has a 30s init timeout, so deps must be pre-bundled
             from aws_cdk import aws_s3_assets as s3_assets, BundlingOptions, DockerImage
             agentcore_code_asset = s3_assets.Asset(self, "AgentCoreCodeAsset",
-                path="./lambda/qna_bot_strands",
+                path="./lambda/qna_bot_agentcore",
                 bundling=BundlingOptions(
                     image=DockerImage.from_registry("public.ecr.aws/sam/build-python3.12:latest"),
                     command=[
@@ -243,7 +243,7 @@ class QnAStack(Stack):
             # Classic mode: uses direct Bedrock RetrieveAndGenerate API on Lambda
             qna_bot_lambda = _lambda.Function(self,
                             "qna_bot_lambda",
-                            code=_lambda.Code.from_asset("./lambda/qna_bot"),
+                            code=_lambda.Code.from_asset("./lambda/qna_bot_classic"),
                             runtime=_lambda.Runtime.PYTHON_3_12,
                             architecture=_lambda.Architecture.ARM_64,
                             memory_size=512,
