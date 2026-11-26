@@ -1,132 +1,248 @@
-## Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
-## SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0
-## Licensed under the Amazon Software License  https://aws.amazon.com/asl/
-"""
-Bedrock AgentCore Runtime entry point for the Strands Agent QnA Bot.
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+"""Bedrock AgentCore Runtime entry point for the Strands Agent QnA bot.
 
-This module provides the entrypoint handler for deploying the QnA bot
-as a Bedrock AgentCore Runtime service. It uses the bedrock-agentcore SDK
-to expose the agent as an HTTP service with /invocations and /ping endpoints.
+The bedrock-agentcore SDK exposes this module as an HTTP service (/invocations and
+/ping). The CDK stack starts it with ``opentelemetry-instrument agentcore_handler.py``.
 
-Usage:
-    Deploy to AgentCore Runtime using the CDK construct or starter toolkit.
-    The agent is invoked via the /invocations POST endpoint.
+One Strands agent is cached per AgentCore session (``context.session_id``), so the
+conversation history is kept across turns for the lifetime of the session. The agent
+answers only from a custom ``search_course_materials`` tool that queries the knowledge
+base with the course/week filter applied server-side; the model never sees the
+knowledge base id, result count or filter, and the user turn is only the question. Retrieved
+passages are labelled with their document title rather than their S3 location, so answers do
+not disclose bucket names or object keys.
 
-    Example invocation payload:
+Example invocation payload (forwarded by the WebSocket proxy Lambda):
     {
-        "prompt": "What is machine learning?",
+        "user_question": "What is machine learning?",
         "course_name": "Fundamentals of Machine Learning",
         "course_id": "ML-001",
         "week_number": 2
     }
+
+Configuration (environment variables set by the CDK stack):
+    KNOWLEDGE_BASE_ID and QnA_MODEL_ID are required; GUARDRAIL_ID, GUARDRAIL_VERSION,
+    KB_MAX_RESULTS (default 3) and USER_AGENT_STRING (the solution user-agent suffix of
+    the AWS SDK clients) are optional; the region comes from AWS_REGION or
+    AWS_DEFAULT_REGION.
 """
-import json
-import os
 import logging
+import os
+import posixpath
+import threading
+from urllib.parse import unquote, urlparse
 
+import boto3
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
-from strands import Agent
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
+from strands import Agent, tool
 from strands.models import BedrockModel
-from strands_tools import retrieve
 
-from helper import build_retrieve_filter, build_system_prompt
+from helper import SYSTEM_PROMPT, build_retrieve_filter, validate_payload
 
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# Fail fast on missing configuration instead of discovering it on the first request.
+KB_ID = os.environ["KNOWLEDGE_BASE_ID"]
+MODEL_ID = os.environ["QnA_MODEL_ID"]
+KB_MAX_RESULTS = int(os.getenv("KB_MAX_RESULTS", "3"))
+REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
+GUARDRAIL_ID = os.getenv("GUARDRAIL_ID", "")
+GUARDRAIL_VERSION = os.getenv("GUARDRAIL_VERSION", "")
+
+MAX_RETRIEVAL_QUERY_CHARS = 1000
+MAX_CACHED_SESSIONS = 100
+GENERIC_ERROR = "The assistant could not answer right now. Please try again."
 
 app = BedrockAgentCoreApp()
 
+# The stack passes the solution user-agent suffix in USER_AGENT_STRING (see "Solution ID and usage
+# reporting" in the README). Without the variable the clients are created without a suffix.
+SOLUTION_USER_AGENT = os.environ.get("USER_AGENT_STRING", "")
+# Read timeout that Strands sets on its Bedrock Runtime client. Strands sets it only when it is given
+# no client configuration, so the configuration below states it.
+MODEL_READ_TIMEOUT_SECONDS = 120
 
-def _create_agent():
-    """Create and configure the Strands Agent with Bedrock model and retrieve tool."""
-    model_id = os.getenv("QnA_MODEL_ID", "us.anthropic.claude-sonnet-4-6")
-    guardrail_id = os.getenv("GUARDRAIL_ID", "")
-    guardrail_version = os.getenv("GUARDRAIL_VERSION", "")
+bedrock_agent_runtime = boto3.client(
+    "bedrock-agent-runtime", region_name=REGION, config=Config(user_agent_extra=SOLUTION_USER_AGENT)
+)
 
-    bedrock_model_kwargs = {
-        "model_id": model_id,
-        "temperature": 0,
-    }
-    if guardrail_id and guardrail_version:
-        bedrock_model_kwargs["guardrail_id"] = guardrail_id
-        bedrock_model_kwargs["guardrail_version"] = guardrail_version
+_model_kwargs = {"model_id": MODEL_ID, "temperature": 0, "region_name": REGION}
+# Strands appends its own user-agent token to the suffix of this client configuration.
+_model_kwargs["boto_client_config"] = Config(
+    user_agent_extra=SOLUTION_USER_AGENT, read_timeout=MODEL_READ_TIMEOUT_SECONDS
+)
+if GUARDRAIL_ID and GUARDRAIL_VERSION:
+    # guardrail_latest_message: as input, the guardrail screens only the newest question, on every
+    # model call of its turn (so again after the search tool result) but not on later turns; it also
+    # screens every answer. Otherwise the whole conversation is screened again as input on every
+    # turn, and an earlier answer about investment strategy trips the denied topic for personalised
+    # financial advice, which blocks every follow-up question of that conversation. A blocked
+    # question is replaced in the history by a placeholder (Strands default), so it does not reach
+    # the model later.
+    _model_kwargs.update(
+        guardrail_id=GUARDRAIL_ID,
+        guardrail_version=GUARDRAIL_VERSION,
+        guardrail_latest_message=True,
+    )
+MODEL = BedrockModel(**_model_kwargs)
 
-    bedrock_model = BedrockModel(**bedrock_model_kwargs)
+# Per-session cache: session id -> (agent, scope). ``scope`` is mutable and refreshed on
+# every request so that week/course changes within a session take effect immediately.
+_SESSIONS: dict[str, tuple[Agent, dict]] = {}
+_SESSION_LOCKS: dict[str, threading.Lock] = {}
+_CACHE_LOCK = threading.Lock()
 
-    return bedrock_model
+
+def _source_title(result):
+    """Return a citation title for a retrieved passage without exposing storage identifiers.
+
+    The knowledge base metadata carries the document's learning objective, which doubles as its
+    title. Otherwise fall back to the object's file name (no bucket, no prefix), so the model can
+    cite the material while answers never reveal S3 bucket names or object keys.
+    """
+    metadata = result.get("metadata") or {}
+    title = metadata.get("learning_objective")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    for value in (result.get("location") or {}).values():
+        if isinstance(value, dict):
+            uri = value.get("uri") or value.get("url")
+            if isinstance(uri, str) and uri:
+                file_name = posixpath.basename(unquote(urlparse(uri).path))
+                if file_name:
+                    return posixpath.splitext(file_name)[0] or file_name
+    return "course material"
+
+
+def _format_results(results):
+    """Concatenate retrieved passages with their document titles for the model."""
+    if not results:
+        return "No matching course materials were found."
+    parts = []
+    for index, result in enumerate(results, start=1):
+        text = (result.get("content") or {}).get("text", "")
+        metadata = result.get("metadata") or {}
+        header = f"[{index}] Source: {_source_title(result)}"
+        week = metadata.get("week")
+        if week is not None:
+            # The knowledge base returns numeric metadata as floats; show "week 1", not "week 1.0"
+            if isinstance(week, float) and week.is_integer():
+                week = int(week)
+            header += f" (week {week})"
+        parts.append(f"{header}\n{text}")
+    return "\n\n".join(parts)
+
+
+def _make_search_tool(scope):
+    """Create the knowledge base search tool bound to one session's mutable scope."""
+
+    @tool
+    def search_course_materials(query: str) -> str:
+        """Search the course materials knowledge base for passages relevant to the question.
+
+        The search is automatically restricted to the student's current course and week.
+
+        Args:
+            query: A focused search query describing the information to look up.
+        """
+        if not isinstance(query, str) or not query.strip():
+            return "The search query must be a non-empty string."
+
+        vector_search = {"numberOfResults": KB_MAX_RESULTS}
+        if scope["filter"]:
+            vector_search["filter"] = scope["filter"]
+
+        try:
+            response = bedrock_agent_runtime.retrieve(
+                knowledgeBaseId=KB_ID,
+                retrievalQuery={"text": query.strip()[:MAX_RETRIEVAL_QUERY_CHARS]},
+                retrievalConfiguration={"vectorSearchConfiguration": vector_search},
+            )
+        except (BotoCoreError, ClientError) as err:
+            logger.error("Knowledge base retrieval failed: %s", type(err).__name__)
+            return "The course materials could not be searched right now."
+
+        results = response.get("retrievalResults", [])
+        logger.info("Knowledge base returned %d results", len(results))
+        return _format_results(results)
+
+    return search_course_materials
+
+
+def _get_session(session_id):
+    """Return the cached (agent, scope) pair and lock for a session, creating them on first use."""
+    with _CACHE_LOCK:
+        entry = _SESSIONS.get(session_id)
+        if entry is None:
+            if len(_SESSIONS) >= MAX_CACHED_SESSIONS:
+                oldest = next(iter(_SESSIONS))
+                _SESSIONS.pop(oldest, None)
+                _SESSION_LOCKS.pop(oldest, None)
+            scope = {"filter": None, "course_name": None, "learning_objective": None}
+            agent = Agent(
+                model=MODEL,
+                system_prompt=SYSTEM_PROMPT,
+                tools=[_make_search_tool(scope)],
+                callback_handler=None,
+            )
+            entry = (agent, scope)
+            _SESSIONS[session_id] = entry
+            _SESSION_LOCKS[session_id] = threading.Lock()
+            logger.info("Created agent for a new session")
+        return entry, _SESSION_LOCKS[session_id]
 
 
 @app.entrypoint
-def invoke(payload):
-    """Process student questions using the Strands Agent with KB retrieval.
+def invoke(payload, context):
+    """Answer a student's question with the per-session Strands agent.
 
-    Args:
-        payload: Dictionary containing:
-            - prompt (str): The student's question (alternative to user_question)
-            - user_question (str): The student's question
-            - course_name (str): Name of the course
-            - course_id (str): Unique course identifier
-            - week_number (int): Week number for content filtering
-            - learning_objective (str): Current learning objective
-            - session_id (str): Optional session identifier
-
-    Returns:
-        Dictionary with bot_response containing the agent's answer.
+    Returns ``{"bot_response": <markdown>}`` or ``{"error": <generic message>}``.
     """
-    # Extract parameters from payload
-    user_question = payload.get("user_question") or payload.get("prompt", "")
-    course_name = payload.get("course_name", None)
-    learning_objective = payload.get("learning_objective", None)
-    course_id = payload.get("course_id", None)
-    week_number = payload.get("week_number", None)
+    try:
+        request = validate_payload(payload)
+    except ValueError as err:
+        logger.warning("Rejected invalid payload: %s", err)
+        return {"error": str(err)}
 
-    # KB_ID is set as an environment variable on the AgentCore Runtime
-    kb_id = os.getenv("KB_ID", "")
+    session_id = getattr(context, "session_id", None) or "default"
+    (agent, scope), lock = _get_session(session_id)
 
-    logger.info("Processing question: %s for course: %s", user_question, course_name)
-
-    # Build the agent
-    bedrock_model = _create_agent()
-    system_prompt = build_system_prompt(course_name, learning_objective)
-
-    # Set KB ID as environment variable for the retrieve tool
-    os.environ["KNOWLEDGE_BASE_ID"] = kb_id
-
-    agent = Agent(
-        model=bedrock_model,
-        system_prompt=system_prompt,
-        tools=[retrieve],
+    logger.info(
+        "Invoking agent course_id=%s week_number=%s question_chars=%d",
+        request["course_id"],
+        request["week_number"],
+        len(request["user_question"]),
     )
 
-    # Build retrieval filter and prompt
-    retrieve_filter = build_retrieve_filter(course_name, course_id, week_number)
+    try:
+        with lock:
+            scope["filter"] = build_retrieve_filter(
+                request["course_name"], request["course_id"], request["week_number"]
+            )
+            scope["course_name"] = request["course_name"]
+            scope["learning_objective"] = request["learning_objective"]
+            # The user turn is only the student's question; course/week scoping is applied in the tool.
+            # Strands adds the question to the history before the first model call and keeps it when
+            # that call fails. Only the newest question is screened, so a question left behind by a
+            # failed turn would reach the model on the next turn without a guardrail verdict: put the
+            # history back.
+            history = list(agent.messages)
+            try:
+                result = agent(request["user_question"])
+            except Exception:
+                agent.messages[:] = history
+                raise
+    except Exception:
+        logger.exception("Agent invocation failed")
+        return {"error": GENERIC_ERROR}
 
-    prompt_parts = [
-        f'A student has asked the following question: "{user_question}"',
-        "",
-        "Please use the retrieve tool to search the knowledge base for relevant information.",
-        f"Use knowledge base ID: {kb_id}",
-        "Set numberOfResults to 3 for focused results.",
-    ]
-
-    if retrieve_filter:
-        prompt_parts.append(f"Apply this filter: {json.dumps(retrieve_filter)}")
-
-    prompt_parts.extend([
-        "",
-        "After retrieving, provide a comprehensive answer based solely on the retrieved content.",
-        "If results don't contain relevant information, state that clearly.",
-    ])
-
-    agent_prompt = "\n".join(prompt_parts)
-
-    # Invoke the agent
-    response = agent(agent_prompt)
-    output_text = str(response)
-
-    logger.info("Agent response generated successfully")
-
-    return {"bot_response": output_text}
+    answer = str(result)
+    logger.info("Agent response generated answer_chars=%d", len(answer))
+    return {"bot_response": answer}
 
 
 if __name__ == "__main__":

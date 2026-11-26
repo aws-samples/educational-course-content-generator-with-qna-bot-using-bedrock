@@ -1,1 +1,1 @@
-langchain_core
+langchain-core==1.6.13

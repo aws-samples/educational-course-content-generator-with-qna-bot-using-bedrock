@@ -1,39 +1,69 @@
-## Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
-## SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0
-## Licensed under the Amazon Software License  https://aws.amazon.com/asl/
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+"""Helpers for the Cognito JWT Lambda authorizer on the QnA WebSocket $connect route."""
 import logging
 import os
 import time
 
 LOGGER = logging.getLogger()
-BASE_ISSUER_URL = f"https://cognito-idp.{os.environ['API_REGION']}.amazonaws.com/{os.environ['COGNITO_USER_POOL_ID']}"
 
+API_REGION = os.environ["API_REGION"]
+ACCOUNT_ID = os.environ["ACCOUNT_ID"]
+COGNITO_USER_POOL_ID = os.environ["COGNITO_USER_POOL_ID"]
+COGNITO_APP_CLIENT_ID = os.environ["COGNITO_APP_CLIENT_ID"]
+
+BASE_ISSUER_URL = f"https://cognito-idp.{API_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}"
 JWKS_URL = f"{BASE_ISSUER_URL}/.well-known/jwks.json"
-VALID_TOKEN_USE = ["id"] 
-
-AUTHORIZED_RESPONSE = {
-    "policyDocument": {
-        "Version": "2012-10-17",
-         "Statement": [
-             {
-                 "Action": "execute-api:Invoke",
-                 "Resource": [f"arn:aws:execute-api:{os.environ['API_REGION']}:{os.environ['ACCOUNT_ID']}:{os.environ['WEBSOCKET_API_ID']}*"],
-                 "Effect": "Allow"
-        }]
-    }
-}
+VALID_TOKEN_USE = ["id"]
+# Cognito signs tokens with RS256 only; the "alg" header of an untrusted token is never used.
+ALLOWED_ALGORITHMS = ["RS256"]
 
 UNAUTHORIZED_RESPONSE = {
+    "principalId": "anonymous",
     "policyDocument": {
         "Version": "2012-10-17",
-         "Statement": [
-             {
-                 "Action": "*",
-                 "Resource": ["*"],
-                 "Effect": "Deny"
-        }]
-    }
+        "Statement": [
+            {
+                "Action": "*",
+                "Resource": ["*"],
+                "Effect": "Deny",
+            }
+        ],
+    },
 }
+
+
+def build_authorized_response(decoded_token):
+    """Build the allow response for a verified Cognito ID token.
+
+    API Gateway exposes ``principalId`` and every ``context`` key to the integration
+    Lambdas of later routes as ``event["requestContext"]["authorizer"][<key>]``; the
+    proxy Lambda uses ``sub`` to derive a per-user AgentCore session.
+
+    :param decoded_token: Dictionary of verified token claims
+    :rtype: Dictionary
+    """
+    sub = decoded_token["sub"]
+    return {
+        "principalId": sub,
+        "policyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Action": "execute-api:Invoke",
+                    "Resource": [
+                        f"arn:aws:execute-api:{API_REGION}:{ACCOUNT_ID}:{os.environ['WEBSOCKET_API_ID']}*"
+                    ],
+                    "Effect": "Allow",
+                }
+            ],
+        },
+        "context": {
+            "sub": sub,
+            "username": str(decoded_token.get("cognito:username") or ""),
+        },
+    }
+
 
 def silence_noisy_loggers():
     """Silence chatty libraries for better logging"""
@@ -54,7 +84,7 @@ def configure_logger():
 
 
 def valid_token(token, audience):
-    """Check JWT token parameters' validity
+    """Check JWT token claims' validity (claim values are never logged)
 
     :param token: Dictionary
     :param audience: String
@@ -65,7 +95,7 @@ def valid_token(token, audience):
     if not expiry_time:
         LOGGER.error("Token does not contain 'exp' key")
         return False
-    
+
     if int(time.time()) > expiry_time:
         LOGGER.error("Token has expired")
         return False
@@ -74,28 +104,33 @@ def valid_token(token, audience):
     if not aud:
         LOGGER.error("Missing 'aud' key in token")
         return False
-    
+
     if aud != audience:
-        LOGGER.error(f"Audience client {aud} does not match")
+        LOGGER.error("Audience claim does not match the app client")
         return False
-    
+
     iss = token.get("iss")
     if not iss:
         LOGGER.error("Missing 'iss' key in token")
         return False
-    
+
     if iss != BASE_ISSUER_URL:
-        LOGGER.error(f"Issuer URL {iss} did not match")
+        LOGGER.error("Issuer claim does not match the user pool")
         return False
 
     token_use = token.get("token_use")
     if not token_use:
         LOGGER.error("token_use missing from token")
         return False
-    
+
     if token_use not in VALID_TOKEN_USE:
-        LOGGER.error(f"token_use {token_use} is not a valid option")
+        LOGGER.error("token_use is not a valid option")
         return False
-    
+
+    sub = token.get("sub")
+    if not isinstance(sub, str) or not sub:
+        LOGGER.error("Missing 'sub' key in token")
+        return False
+
     LOGGER.info("Decoded token is verified to be valid")
     return True

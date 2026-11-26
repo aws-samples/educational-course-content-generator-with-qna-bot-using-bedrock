@@ -15,5 +15,11 @@
   "vpc": {
     "cidr_range": "10.0.0.0/16",
     "cidr_mask": 24
+  },
+  "solution": {
+    "_comment": "AWS Solution identity: the single source of truth for both reporting mechanisms, the CloudFormation stack Description (deployment counting) and the AWS SDK User-Agent suffix (API usage attribution). Not a deployment setting: bump 'version' when cutting a release and otherwise leave it alone. educational_course_content_generator_with_qna_bot_using_bedrock/solution.py is the only reader and always reads THIS file. See that module for the exact formats, and README.md for what is reported and how to opt out.",
+    "id": "SO0384",
+    "name": "Educational Course Content Generator with QnA Bot using Bedrock",
+    "version": "v1.0.0"
   }
 }

@@ -1,12 +1,15 @@
-## Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
-## SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0
-## Licensed under the Amazon Software License  https://aws.amazon.com/asl/
-import os
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+import logging
 import time
-import boto3
 from urllib import parse
+
+import boto3
 from requests_aws4auth import AWS4Auth
 from opensearchpy import OpenSearch, RequestsHttpConnection
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 def create_collection_index(host: str, index_name: str, metadata_field_name: str, text_field_name: str,
@@ -84,7 +87,7 @@ def create_collection_index(host: str, index_name: str, metadata_field_name: str
                                             }
                                         }
                                     )
-    print(response)
+    logger.info("Index created: index=%s acknowledged=%s", index_name, response.get('acknowledged'))
     time.sleep(30)
 
 
@@ -101,11 +104,12 @@ def lambda_handler(event, context):
     ----------
     event : Event information
     """
+    logger.info("Custom resource event: RequestType=%s LogicalResourceId=%s RequestId=%s",
+                event.get('RequestType'), event.get('LogicalResourceId'), event.get('RequestId'))
+
     # Ignore all non-create events
     if event['RequestType'] != 'Create':
         return
-
-    print(event)
 
     # Get Collection name
     collection_name = event.get('ResourceProperties', dict()).get('collection')
@@ -117,7 +121,7 @@ def lambda_handler(event, context):
     text_field = event.get('ResourceProperties', dict()).get('text_field')
     vector_field = event.get('ResourceProperties', dict()).get('vector_field')
     vector_size = event.get('ResourceProperties', dict()).get('vector_size')
-    print(f'Creating index on collection {collection_name} in endpoint {endpoint}')
+    logger.info("Creating index %s on collection %s (endpoint %s)", index_name, collection_name, endpoint)
 
     # Read the basic Collection information
     parts = parse.urlparse(endpoint)
