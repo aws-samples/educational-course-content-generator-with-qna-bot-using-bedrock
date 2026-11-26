@@ -5,6 +5,7 @@ cdk.out/
 # Python
 .venv/
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *.egg-info/
 dist/
@@ -21,6 +22,8 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+~$*
+.~lock.*#
 
 # Blog post (not part of the public repo)
 BLOG_POST_PART2.md
@@ -28,3 +31,4 @@ previous_blog.pdf
 
 # Downloads (test artifacts)
 downloads/
+local_folder*

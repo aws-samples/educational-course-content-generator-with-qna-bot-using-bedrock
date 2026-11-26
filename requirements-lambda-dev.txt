@@ -1,0 +1,14 @@
+# Lambda runtime libraries for local development and testing of the handlers under lambda/.
+# They are not needed to synth or deploy the CDK app (see requirements.txt); the deployed
+# Lambda layers are built from lambda/lambda_layer/*/requirements.txt.
+boto3==1.43.117
+pydantic==2.14.1
+langchain-core==1.6.13
+langchain-community==0.4.2
+langchain-aws==1.9.0
+PyJWT==2.15.1
+cryptography==50.0.2
+PyPDF2==3.0.1
+requests-aws4auth==1.4.0
+opensearch-py==3.2.0
+fsspec==2026.9.0

@@ -1,6 +1,5 @@
-## Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
-## SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0
-## Licensed under the Amazon Software License  https://aws.amazon.com/asl/
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 from aws_cdk import (
     CfnOutput,
     Fn,
@@ -22,11 +21,36 @@ from aws_cdk import (
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as origins,
     aws_kms as kms,
+    aws_logs as logs,
 )
 
 from constructs import Construct
 from cdk_nag import NagSuppressions
 import json
+
+from educational_course_content_generator_with_qna_bot_using_bedrock.solution import user_agent_string
+from educational_course_content_generator_with_qna_bot_using_bedrock.stack_logging import LOG_RETENTION, own_lambda_log_groups
+
+# Model ids starting with one of these prefixes are cross-region inference profiles, not foundation models.
+INFERENCE_PROFILE_PREFIXES = ("us", "eu", "au", "jp", "apac", "global")
+
+
+def bedrock_model_arn(scope, model_id):
+    prefix = model_id.split(".")[0]
+    if prefix in INFERENCE_PROFILE_PREFIXES:
+        return f"arn:aws:bedrock:{scope.region}:{scope.account}:inference-profile/{model_id}"
+    return f"arn:aws:bedrock:{scope.region}::foundation-model/{model_id}"
+
+
+def bedrock_claude_iam_resources(scope, model_id):
+    """IAM resources needed to invoke Anthropic Claude models directly or through the configured inference profile."""
+    prefix = model_id.split(".")[0]
+    if prefix not in INFERENCE_PROFILE_PREFIXES:
+        prefix = "us"
+    return [
+        "arn:aws:bedrock:*::foundation-model/anthropic.claude-*",
+        f"arn:aws:bedrock:{scope.region}:{scope.account}:inference-profile/{prefix}.anthropic.claude-*",
+    ]
 
 
 class CourseStack(Stack):
@@ -50,6 +74,13 @@ class CourseStack(Stack):
             subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS, 
             cidr_mask=variables["vpc"]["cidr_mask"]
         )
+        # The flow log group is owned by the stack: it has a retention period and is deleted by `cdk destroy`
+        vpc_flow_log_group = logs.LogGroup(
+            self,
+            "VpcFlowLogGroup",
+            retention=LOG_RETENTION,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
         vpc = ec2.Vpc(
             scope=self,
             id="DemoVPC",
@@ -57,7 +88,7 @@ class CourseStack(Stack):
             subnet_configuration=[public_subnet, private_subnet],
             flow_logs={
                 "cloudwatch":ec2.FlowLogOptions(
-                    destination=ec2.FlowLogDestination.to_cloud_watch_logs()
+                    destination=ec2.FlowLogDestination.to_cloud_watch_logs(vpc_flow_log_group)
              )
             }
         )
@@ -92,7 +123,12 @@ class CourseStack(Stack):
                 sid="AllowCloudFrontLogDelivery",
                 actions=["s3:PutObject"],
                 principals=[iam.ServicePrincipal("delivery.logs.amazonaws.com")],
-                resources=[access_logs_bucket.arn_for_objects("*")]
+                resources=[access_logs_bucket.arn_for_objects("*")],
+                # Confused-deputy protection: only log deliveries created in this account may write here
+                conditions={
+                    "StringEquals": {"aws:SourceAccount": self.account},
+                    "ArnLike": {"aws:SourceArn": f"arn:aws:logs:{self.region}:{self.account}:delivery-source:*"},
+                },
             )
         )
 
@@ -132,6 +168,8 @@ class CourseStack(Stack):
         # Cfnoutput the bucket
         CfnOutput(self, "AccessLogsBucketName", export_name="AccessLogsBucketName", value=access_logs_bucket.bucket_name)
         CfnOutput(self, "KBBucketName", export_name="KBBucketName", value=kb_bucket_s3.bucket_name)
+        CfnOutput(self, "InputBucketName", export_name="InputBucketName", value=input_bucket_s3.bucket_name)
+        CfnOutput(self, "OutputBucketName", export_name="OutputBucketName", value=output_bucket_s3.bucket_name)
 
         # # Add a policy to allow access through the VPC Endpoint for the access logs bucket
         # access_logs_bucket.add_to_resource_policy(
@@ -207,7 +245,11 @@ class CourseStack(Stack):
         user_pool = cognito.UserPool(
             self, "CourseUserPool",
             user_pool_name="CourseUserPool",
-            self_sign_up_enabled=True,
+            # Only an administrator can create users (scripts/create_cognito_user.py and the demo call
+            # AdminCreateUser). With self sign-up, anyone who knows the app client ID could create accounts
+            # in the user pool. The verification message below is not used by the sample: the pool verifies
+            # no attribute automatically.
+            self_sign_up_enabled=False,
             account_recovery=cognito.AccountRecovery.EMAIL_ONLY,
             user_verification=cognito.UserVerificationConfig(
                 email_subject="Verify your email for outline and content generation App",
@@ -215,6 +257,16 @@ class CourseStack(Stack):
                 email_style=cognito.VerificationEmailStyle.CODE,
             ),
             standard_attributes={"fullname": cognito.StandardAttribute(required=True, mutable=True)},
+            # MFA can be enrolled (TOTP) but is not required; set Mfa.REQUIRED before production use
+            mfa=cognito.Mfa.OPTIONAL,
+            mfa_second_factor=cognito.MfaSecondFactor(otp=True, sms=False),
+            password_policy=cognito.PasswordPolicy(
+                min_length=8,
+                require_lowercase=True,
+                require_uppercase=True,
+                require_digits=True,
+                require_symbols=True,
+            ),
             removal_policy=RemovalPolicy.DESTROY,
         )
 
@@ -325,10 +377,13 @@ class CourseStack(Stack):
                             )
         
         ######################### SQS and DLQ  #########################
-        # Create a KMS key for encryption
+        # Create a KMS key for encryption. `cdk destroy` schedules the key for deletion; it disappears after
+        # the waiting period that KMS enforces (7 days is the minimum).
         kms_key = kms.Key(self, "SQSEncryptionKey",
             description="KMS key for SQS queue encryption",
-            enable_key_rotation=True
+            enable_key_rotation=True,
+            removal_policy=RemovalPolicy.DESTROY,
+            pending_window=Duration.days(7),
         )
         
         outline_dlq = sqs.Queue(
@@ -410,6 +465,7 @@ class CourseStack(Stack):
                                 vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
                                 environment={
                                     "MODEL_ID":model_id,
+                                    "INPUT_BUCKET_NAME":input_bucket_s3.bucket_name,
                                     "OUTPUT_BUCKET":output_bucket_s3.bucket_name,
                                 }
                             )
@@ -417,14 +473,12 @@ class CourseStack(Stack):
         output_bucket_s3.grant_read_write(course_outline_llm_lambda)
         course_connections_ddb_table.grant_read_write_data(course_outline_llm_lambda)
         outline_queue.grant_consume_messages(course_outline_llm_lambda)
-        haiku_sonnet_bedrock_policy_statement = iam.PolicyStatement(
+        bedrock_model_policy_statement = iam.PolicyStatement(
             effect=iam.Effect.ALLOW,
             actions=["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
-            resources=[f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-haiku-4-5*",
-                       f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-sonnet-4*",
-                       ]
+            resources=bedrock_claude_iam_resources(self, model_id),
         )
-        course_outline_llm_lambda.add_to_role_policy(haiku_sonnet_bedrock_policy_statement)
+        course_outline_llm_lambda.add_to_role_policy(bedrock_model_policy_statement)
 
         # This event will be triggered by SQS when a new message is received
         invoke_event_outline = lambda_event_sources.SqsEventSource(outline_queue, 
@@ -465,6 +519,7 @@ class CourseStack(Stack):
                                 vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
                                 environment={
                                     "MODEL_ID":model_id,
+                                    "INPUT_BUCKET_NAME":input_bucket_s3.bucket_name,
                                     "OUTPUT_BUCKET":output_bucket_s3.bucket_name,
                                 }
                             )
@@ -472,14 +527,12 @@ class CourseStack(Stack):
         output_bucket_s3.grant_read_write(course_content_llm_lambda)
         course_connections_ddb_table.grant_read_write_data(course_content_llm_lambda)
         content_queue.grant_consume_messages(course_content_llm_lambda)
-        haiku_sonnet_bedrock_policy_statement = iam.PolicyStatement(
+        bedrock_model_policy_statement = iam.PolicyStatement(
             effect=iam.Effect.ALLOW,
             actions=["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
-            resources=[f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-haiku-4-5*",
-                       f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-sonnet-4*",
-                       ]
+            resources=bedrock_claude_iam_resources(self, model_id),
         )
-        course_content_llm_lambda.add_to_role_policy(haiku_sonnet_bedrock_policy_statement)
+        course_content_llm_lambda.add_to_role_policy(bedrock_model_policy_statement)
 
         # This event will be triggered by SQS when a new message is received
         invoke_event_content = lambda_event_sources.SqsEventSource(content_queue, 
@@ -577,6 +630,9 @@ class CourseStack(Stack):
                                             )
         
         # Creating the CloudFront distribution
+        # minimum_protocol_version only takes effect once a custom domain with an ACM certificate is configured.
+        # With the default *.cloudfront.net certificate used here, CloudFront applies the TLSv1 security policy,
+        # so viewers can still negotiate TLS 1.0/1.1.
         course_cloudfront_dist=cloudfront.Distribution(self, 
                                     "courseWSCloudFrontDist",
                                     default_behavior=cloudfront_behavior,
@@ -600,11 +656,11 @@ class CourseStack(Stack):
                                                    jwt_auth_course_lambda.role],
                             suppressions=[{
                                                 "id": "AwsSolutions-IAM4",
-                                                "reason": "This code is for demo purposes. So lambda might have too permissive policies. Please scope down the permission in produciton.",
+                                                "reason": "AWSLambdaBasicExecutionRole and AWSLambdaVPCAccessExecutionRole are the AWS managed policies that give Lambda its CloudWatch Logs and VPC ENI permissions; they have no resource-level scoping to narrow.",
                                             },
                                             {
                                                 "id": "AwsSolutions-IAM5",
-                                                "reason": "This code is for demo purposes. So granted access to all indices of S3 bucket.",
+                                                "reason": "Wildcards are limited to: s3:*Object*/List*/Abort* on objects of the input and output buckets (<bucket>/*), <table>/index/* from grant_read_write_data on the connections table, kms:GenerateDataKey*/ReEncrypt* on the single SQS key, execute-api @connections/* on this WebSocket API only, and foundation-model/anthropic.claude-* plus the inference-profile prefix derived from model_id so the model version can change without an IAM change.",
                                             }
                                         ],
                             apply_to_children=True)
@@ -624,16 +680,12 @@ class CourseStack(Stack):
         # CDK NAG suppression
         NagSuppressions.add_resource_suppressions([user_pool],
                             suppressions=[{
-                                                "id": "AwsSolutions-COG1",
-                                                "reason": "This code is for demo purposes. So suppressing Cognito user pool password policy warning",
-                                            },
-                                            {
                                                 "id": "AwsSolutions-COG2",
-                                                "reason": "This code is for demo purposes. So suppressing Cognito user pool MFA warning",
+                                                "reason": "MFA is left optional (mfa not set to REQUIRED) because sample users are created by scripts/create_cognito_user.py and sign in with username and password from the demo client; set mfa=REQUIRED before any production use.",
                                             },
                                             {
-                                                "id": "AwsSolutions-COG3",
-                                                "reason": "This code is for demo purposes. So suppressing Cognito user pool advanced security mode warning",
+                                                "id": "AwsSolutions-COG8",
+                                                "reason": "Sample deployment; the Cognito Plus feature plan (threat protection) adds per-MAU cost and is left to adopters to enable.",
                                             },
                                         ],
                             apply_to_children=True)
@@ -642,15 +694,11 @@ class CourseStack(Stack):
         NagSuppressions.add_resource_suppressions([course_ws_api],
                             suppressions=[{
                                                 "id": "AwsSolutions-APIG1",
-                                                "reason": "This code is for demo purposes. Suppressing access logging enabled.",
+                                                "reason": "Access logging on the dev WebSocket stage is left disabled for this sample; request logging is captured by the CloudFront standard logs written to the access-logs bucket.",
                                             },
                                             {
                                                 "id": "AwsSolutions-APIG4",
-                                                "reason": "Lambda Authorizer with Congito is on $connect route and it's not applicable for other routes.",
-                                            },
-                                            {
-                                                "id": "AwsSolutions-APIG6",
-                                                "reason": "This code is for demo purposes. Suppressing CloudWatch logging enabled for all methods.",
+                                                "reason": "Lambda Authorizer with Cognito is on $connect route and it's not applicable for other routes.",
                                             },
                                         ],
                             apply_to_children=True)
@@ -659,7 +707,7 @@ class CourseStack(Stack):
         NagSuppressions.add_resource_suppressions([course_ws_stage],
                             suppressions=[{
                                                 "id": "AwsSolutions-APIG1",
-                                                "reason": "This code is for demo purposes. Suppressing access logging enabled.",
+                                                "reason": "Access logging on the dev WebSocket stage is left disabled for this sample; request logging is captured by the CloudFront standard logs written to the access-logs bucket.",
                                             },
                                         ],
                             apply_to_children=True)
@@ -668,11 +716,11 @@ class CourseStack(Stack):
         NagSuppressions.add_resource_suppressions([course_cloudfront_dist],
                             suppressions=[{
                                                 "id": "AwsSolutions-CFR1",
-                                                "reason": "This code is for demo purposes. Geo restrictions are managed by WAF GeoMatch rule.",
+                                                "reason": "Geo restriction is enforced by the GeoMatch rule of the CloudFront web ACL from CloudFrontWAFStack instead of the distribution's own geo restriction setting.",
                                             },
                                             {
                                                 "id": "AwsSolutions-CFR4",
-                                                "reason": "This code is for demo purposes. Certificate is not mandatory therefore the Cloudfront certificate will be used.",
+                                                "reason": "The sample has no custom domain, so the distribution uses the default *.cloudfront.net certificate. With that certificate CloudFront applies the TLSv1 security policy, so viewers can still negotiate TLS 1.0/1.1; the TLSv1.2_2021 minimum protocol version only takes effect once a custom domain with an ACM certificate is configured.",
                                             },
                                         ],
                             apply_to_children=True)
@@ -685,5 +733,20 @@ class CourseStack(Stack):
                                         "reason": "Python 3.12 is the latest runtime version supported by all Lambda layers and dependencies used in this solution.",
                                     },
                                 ])
-        
 
+        ######################### Solution user agent #########################
+        # The code of the Lambda functions cannot import solution.py: it reads the solution user-agent
+        # suffix for its AWS SDK clients from this variable (see "Solution ID and usage reporting" in the
+        # README). Every Lambda function of this stack whose code creates an AWS SDK client gets it, so add
+        # a new function to this list when its code calls AWS. The authorizer creates no client.
+        solution_user_agent = user_agent_string()
+        if solution_user_agent:
+            for function in (course_ws_connect_lambda, course_ws_disconnect_lambda, course_ws_default_lambda,
+                             course_outline_ws_lambda, course_outline_llm_lambda,
+                             course_content_ws_lambda, course_content_llm_lambda):
+                function.add_environment("USER_AGENT_STRING", solution_user_agent)
+
+        ######################### Log Groups #########################
+        # Keep this as the last statement: only the functions that exist at this point, including the ones
+        # CDK creates for custom resources, get a log group
+        own_lambda_log_groups(self)

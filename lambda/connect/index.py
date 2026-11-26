@@ -1,19 +1,29 @@
-## Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
-## SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0
-## Licensed under the Amazon Software License  https://aws.amazon.com/asl/
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+import logging
 import os
-import json
-import boto3
 from datetime import datetime, timedelta, timezone
 
-dynamodb = boto3.client('dynamodb')
+import boto3
+from botocore.config import Config
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# The stack passes the solution user-agent suffix in USER_AGENT_STRING (see "Solution ID and usage
+# reporting" in the README). Without the variable the clients are created without a suffix.
+SDK_CONFIG = Config(user_agent_extra=os.environ.get("USER_AGENT_STRING", ""))
+dynamodb = boto3.client('dynamodb', config=SDK_CONFIG)
 
 
 def lambda_handler(event, context):
-    print(event)
+    request_context = event.get('requestContext', {})
+    connection_id = request_context['connectionId']
+    request_id = getattr(context, 'aws_request_id', '')
+    logger.info("route=%s connectionId=%s requestId=%s",
+                request_context.get('routeKey'), connection_id, request_id)
 
-    CONNECTIONS_TABLE = os.environ.get('CONNECTIONS_TABLE')
-    connection_id = event['requestContext']['connectionId']
+    connections_table = os.environ.get('CONNECTIONS_TABLE')
 
     now = datetime.now(timezone.utc)
     future_time = now + timedelta(days=1)
@@ -21,26 +31,23 @@ def lambda_handler(event, context):
 
     try:
         dynamodb.put_item(
-            TableName=CONNECTIONS_TABLE,
+            TableName=connections_table,
             Item={
                 'connectionId': {'S': connection_id},
                 'ttl': {'N': str(ttl)}
             }
         )
-        print(f"Connection ID {connection_id} added.")
+        logger.info("Connection registered: connectionId=%s requestId=%s", connection_id, request_id)
 
         return {
-            'statusCode': 200, 
+            'statusCode': 200,
             'body': 'Connected.'
-            }
-    
-    except Exception as e:
-        print(f"Error adding connection ID: {e}")
+        }
+
+    except Exception:
+        logger.exception("Failed to register connection: connectionId=%s requestId=%s",
+                         connection_id, request_id)
         return {
-            'statusCode': 500, 
+            'statusCode': 500,
             'body': 'Failed to connect.'
-            }
-    
-if __name__ == "__main__":
-    event = None
-    lambda_handler(event, None)
+        }

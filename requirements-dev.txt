@@ -1,1 +1,4 @@
+# Unit test dependencies. tests/unit/test_kb_sync.py loads the Knowledge Base sync Lambda handler,
+# which imports boto3; keep the version in step with requirements-lambda-dev.txt.
 pytest==9.0.3
+boto3==1.43.117

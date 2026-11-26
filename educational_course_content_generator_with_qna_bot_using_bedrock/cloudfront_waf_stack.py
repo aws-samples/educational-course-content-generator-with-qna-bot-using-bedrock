@@ -1,6 +1,5 @@
-## Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
-## SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0
-## Licensed under the Amazon Software License  https://aws.amazon.com/asl/
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 from aws_cdk import (
   aws_wafv2 as wafv2,
   CfnOutput,
@@ -73,6 +72,8 @@ class CloudFrontWAFStack(Stack):
                 "GB", ## United Kingdom
                 "BE", ## Belgium
                 "NL", ## Netherlands
+                "US", ## United States
+                "AE", ## United Arab Emirates
               ] ## country_codes
             ) ## geo_match_statement
           ) ## statement
